@@ -1,0 +1,266 @@
+/**
+ * @description Trigger on Account object to handle owner change propagation to Contacts
+ * @author Your Name
+ * @date 2025-03-21
+ */
+trigger AccountTrigger on Account (after update) {
+    AccountTriggerHandler handler = new AccountTriggerHandler();
+    handler.onAfterUpdate(Trigger.newMap, Trigger.oldMap);
+}
+
+/**
+ * @description Handler class for Account trigger operations
+ * @author Your Name
+ * @date 2025-03-21
+ */
+public without sharing class AccountTriggerHandler {
+    // Static variable to prevent recursive execution
+    private static Boolean isExecuting = false;
+    
+    /**
+     * @description Handles after update trigger context
+     * @param newAccountMap Map of new Account records after update
+     * @param oldAccountMap Map of old Account records before update
+     */
+    public void onAfterUpdate(Map<Id, Account> newAccountMap, Map<Id, Account> oldAccountMap) {
+        // Prevent recursive execution
+        if (isExecuting) return;
+        
+        try {
+            isExecuting = true;
+            
+            // Only process owner changes to minimize unnecessary processing
+            Map<Id, Account> accountsWithOwnerChange = filterAccountsByOwnerChange(newAccountMap.values(), oldAccountMap);
+            if (!accountsWithOwnerChange.isEmpty()) {
+                updateRelatedContactOwners(accountsWithOwnerChange);
+            }
+        } finally {
+            // Reset recursion flag
+            isExecuting = false;
+        }
+    }
+    
+    /**
+     * @description Filters accounts where owner has changed
+     * @param accounts List of Account records to filter
+     * @param oldAccountMap Map of old Account records for comparison
+     * @return Map<Id, Account> Filtered map of accounts with owner changes
+     */
+    private Map<Id, Account> filterAccountsByOwnerChange(List<Account> accounts, Map<Id, Account> oldAccountMap) {
+        Map<Id, Account> accountsWithOwnerChange = new Map<Id, Account>();
+        
+        for (Account newAccount : accounts) {
+            Account oldAccount = oldAccountMap.get(newAccount.Id);
+            
+            // Check if owner has changed
+            if (newAccount.OwnerId != oldAccount.OwnerId) {
+                accountsWithOwnerChange.put(newAccount.Id, newAccount);
+            }
+        }
+        
+        return accountsWithOwnerChange;
+    }
+    
+    /**
+     * @description Updates ownership of contacts related to specified accounts
+     * @param accountsWithOwnerChange Map of accounts where owner has changed
+     */
+    private void updateRelatedContactOwners(Map<Id, Account> accountsWithOwnerChange) {
+        try {
+            // Query related contacts using static SOQL
+            List<Contact> contactsToUpdate = new List<Contact>();
+            
+            for (Contact contact : [SELECT Id, AccountId, OwnerId FROM Contact 
+                                   WHERE AccountId IN :accountsWithOwnerChange.keySet()]) {
+                Account parentAccount = accountsWithOwnerChange.get(contact.AccountId);
+                
+                // Update contact owner to match account owner
+                if (contact.OwnerId != parentAccount.OwnerId) {
+                    contact.OwnerId = parentAccount.OwnerId;
+                    contactsToUpdate.add(contact);
+                }
+            }
+            
+            // Process in chunks to avoid DML governor limits
+            if (!contactsToUpdate.isEmpty()) {
+                processInChunks(contactsToUpdate, 'Contact', 'update');
+            }
+            
+        } catch (Exception ex) {
+            logException(ex, 'updateRelatedContactOwners');
+        }
+    }
+    
+    /**
+     * @description Processes SObjects in chunks to avoid governor limits
+     * @param records List of SObjects to process
+     * @param objectType String name of the SObject type
+     * @param operation String name of the DML operation
+     */
+    private void processInChunks(List<SObject> records, String objectType, String operation) {
+        final Integer MAX_DML_CHUNK = 9000; // Slightly below the 10K limit for safety
+        
+        // Create a copy of the list so we can modify it
+        List<SObject> recordsToProcess = new List<SObject>(records);
+        
+        while (!recordsToProcess.isEmpty()) {
+            // Recalculate remaining DML capacity dynamically
+            Integer remainingDmlRows = Limits.getLimitDmlRows() - Limits.getDmlRows();
+            
+            if (remainingDmlRows <= 0) {
+                // Log that we've hit the governor limit
+                String message = 'DML row limit reached. ' + recordsToProcess.size() + 
+                                 ' ' + objectType + ' records not processed.';
+                System.debug(LoggingLevel.ERROR, message);
+                
+                logCustomError(objectType, operation, message, null);
+                break;
+            }
+            
+            // Calculate size of this chunk
+            Integer chunkSize = Math.min(Math.min(MAX_DML_CHUNK, remainingDmlRows), recordsToProcess.size());
+            
+            // Extract chunk for processing
+            List<SObject> chunk = new List<SObject>();
+            for (Integer i = 0; i < chunkSize; i++) {
+                chunk.add(recordsToProcess.remove(0));
+            }
+            
+            if (!chunk.isEmpty()) {
+                // Process this chunk
+                Database.SaveResult[] results = Database.update(chunk, false);
+                processDmlErrors(results, objectType, operation);
+            }
+        }
+    }
+    
+    /**
+     * @description Processes and logs DML operation errors
+     * @param results List of Database.SaveResult from DML operation
+     * @param objectType String representation of the object type
+     * @param operation String representation of the operation performed
+     */
+    private void processDmlErrors(Database.SaveResult[] results, String objectType, String operation) {
+        List<String> errors = new List<String>();
+        List<Error_Log__c> errorLogs = new List<Error_Log__c>();
+        
+        for (Integer i = 0; i < results.size(); i++) {
+            if (!results[i].isSuccess()) {
+                for (Database.Error err : results[i].getErrors()) {
+                    String errorMessage = objectType + ' ' + operation + ' error: ' + 
+                                        err.getStatusCode() + ': ' + err.getMessage() + 
+                                        ' on record ID: ' + results[i].getId();
+                    
+                    errors.add(errorMessage);
+                    System.debug(LoggingLevel.ERROR, errorMessage);
+                    
+                    // Add to error logs if the custom object exists
+                    errorLogs.add(createErrorLog(
+                        objectType,
+                        operation,
+                        err.getMessage(),
+                        String.valueOf(results[i].getId()),
+                        String.valueOf(err.getStatusCode()),
+                        null
+                    ));
+                }
+            }
+        }
+        
+        // Insert error logs if any
+        if (!errorLogs.isEmpty()) {
+            insertErrorLogs(errorLogs);
+        }
+    }
+    
+    /**
+     * @description Creates an Error_Log__c record
+     * @param objectType The object type name
+     * @param operation The operation type
+     * @param errorMessage The error message
+     * @param recordId The affected record ID
+     * @param statusCode The error status code
+     * @param stackTrace The exception stack trace if available
+     * @return Error_Log__c The created error log record
+     */
+    private Error_Log__c createErrorLog(
+        String objectType, 
+        String operation, 
+        String errorMessage, 
+        String recordId, 
+        String statusCode, 
+        String stackTrace
+    ) {
+        return new Error_Log__c(
+            Object_Type__c = objectType,
+            Operation_Type__c = operation,
+            Error_Message__c = errorMessage,
+            Record_ID__c = recordId,
+            Status_Code__c = statusCode,
+            Stack_Trace__c = stackTrace,
+            Error_Date_Time__c = System.now()
+        );
+    }
+    
+    /**
+     * @description Inserts error log records safely with proper object verification
+     * @param errorLogs List of error log records to insert
+     */
+    private void insertErrorLogs(List<Error_Log__c> errorLogs) {
+        try {
+            // Check if Error_Log__c object exists and is accessible
+            if (Schema.getGlobalDescribe().containsKey('Error_Log__c') && 
+                Schema.sObjectType.Error_Log__c.isCreateable()) {
+                insert errorLogs;
+            } else {
+                // Fallback if object doesn't exist or isn't accessible
+                for (Error_Log__c log : errorLogs) {
+                    System.debug(LoggingLevel.ERROR, 'Error Log: ' + log);
+                }
+            }
+        } catch (Exception ex) {
+            // Final fallback - debug logging only
+            System.debug(LoggingLevel.ERROR, 'Failed to insert error logs: ' + ex.getMessage());
+            for (Error_Log__c log : errorLogs) {
+                System.debug(LoggingLevel.ERROR, 'Unlogged Error: ' + log);
+            }
+        }
+    }
+    
+    /**
+     * @description Logs a custom error message
+     * @param objectType The object type name
+     * @param operation The operation being performed
+     * @param errorMessage The error message
+     * @param recordId The affected record ID (if applicable)
+     */
+    private void logCustomError(String objectType, String operation, String errorMessage, String recordId) {
+        System.debug(LoggingLevel.ERROR, errorMessage);
+        
+        Error_Log__c log = createErrorLog(objectType, operation, errorMessage, recordId, null, null);
+        insertErrorLogs(new List<Error_Log__c>{ log });
+    }
+    
+    /**
+     * @description Logs exceptions in a standardized format
+     * @param ex The exception to log
+     * @param methodName Name of the method where exception occurred
+     */
+    private void logException(Exception ex, String methodName) {
+        String errorMsg = 'Exception in AccountTriggerHandler.' + methodName + 
+                          ': ' + ex.getMessage() + ' Stack: ' + ex.getStackTraceString();
+        System.debug(LoggingLevel.ERROR, errorMsg);
+        
+        // Log to custom object
+        Error_Log__c log = createErrorLog(
+            'Account',
+            'Contact Owner Update',
+            ex.getMessage(),
+            null,
+            null,
+            ex.getStackTraceString()
+        );
+        
+        insertErrorLogs(new List<Error_Log__c>{ log });
+    }
+}
