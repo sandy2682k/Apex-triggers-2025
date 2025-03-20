@@ -1,6 +1,6 @@
 /**
  * @description Trigger on Account object to handle owner change propagation to Contacts
- * @author Your Name
+ * @author Your Sandeep
  * @date 2025-03-21
  */
 trigger AccountTrigger on Account (after update) {
